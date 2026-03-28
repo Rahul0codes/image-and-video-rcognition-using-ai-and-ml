@@ -1,0 +1,128 @@
+/**
+ * Core Philosophy: This ruleset enforces a strict user-ownership model where all
+ * data is exclusively controlled by the user who created it. Access is determined
+ * by the user's authenticated UID, which must match the {userProfileId} segment
+ * in the document path.
+ *
+ * Data Structure: The database is organized hierarchically, with all user-specific
+ * data nested under the /userProfiles/{userProfileId} collection. This includes
+ * projects, images, insights, and event logs. This structure ensures that queries
+ * are naturally scoped to a single user's data, enhancing security and performance.
+ *
+ * Key Security Decisions:
+ * - User Enumeration is explicitly blocked by disallowing `list` operations on the
+ *   top-level /userProfiles collection.
+ * - All subcollections (projects, images, etc.) can only be read, listed, and
+ *   modified by the user who owns the parent userProfile document.
+ * - Event logs (/eventLogs) are treated as append-only records. Users can create
+ *   their own log entries but cannot modify or delete them, preserving audit integrity.
+ *
+ * Denormalization for Authorization: To ensure fast and secure authorization,
+ * documents store ownership information (e.g., `userProfileId`) that is validated
+ * against the path during writes. This avoids slow and costly `get()` calls to parent
+ * documents, adhering to the "Authorization Independence" principle.
+ *
+ * Structural Segregation: All data is private and user-scoped. There are no public
+ * collections, and all access requires authentication. The hierarchical structure
+ * naturally segregates one user's data from another's.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for DRY and readable rules
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Checks if the requesting user is the owner of a document based on the userId in the path.
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Checks if a document currently exists. Used for safe updates and deletes.
+    function isExistingDocument() {
+      return resource != null;
+    }
+
+    // A composite function for update/delete operations, ensuring the user is the owner AND the document exists.
+    function isExistingOwner(userId) {
+      return isOwner(userId) && isExistingDocument();
+    }
+
+    /**
+     * @description Controls access to a user's own profile document.
+     * @path /userProfiles/{userProfileId}
+     * @allow A signed-in user (auth.uid='user123') can (create) their own profile at /userProfiles/user123.
+     * @deny A signed-in user (auth.uid='user456') cannot (get) a profile at /userProfiles/user123.
+     * @principle Restricts access to a user's own data tree and prevents user enumeration.
+     */
+    match /userProfiles/{userProfileId} {
+      allow get: if isOwner(userProfileId);
+      allow list: if false;
+      allow create: if isOwner(userProfileId) && request.resource.data.id == userProfileId && request.resource.data.externalAuthId == userProfileId;
+      allow update: if isExistingOwner(userProfileId) && request.resource.data.id == resource.data.id && request.resource.data.externalAuthId == resource.data.externalAuthId;
+      allow delete: if isExistingOwner(userProfileId);
+    }
+
+    /**
+     * @description Controls access to a user's projects, which are nested under their profile.
+     * @path /userProfiles/{userProfileId}/projects/{projectId}
+     * @allow A signed-in user (auth.uid='user123') can (list) all projects at /userProfiles/user123/projects.
+     * @deny A signed-in user (auth.uid='user456') cannot (create) a project at /userProfiles/user123/projects/proj-abc.
+     * @principle Enforces document ownership for writes and validates relational integrity between documents.
+     */
+    match /userProfiles/{userProfileId}/projects/{projectId} {
+      allow get: if isOwner(userProfileId);
+      allow list: if isOwner(userProfileId);
+      allow create: if isOwner(userProfileId) && request.resource.data.userProfileId == userProfileId;
+      allow update: if isExistingOwner(userProfileId) && request.resource.data.userProfileId == resource.data.userProfileId;
+      allow delete: if isExistingOwner(userProfileId);
+    }
+
+    /**
+     * @description Controls access to a user's images, nested within their projects.
+     * @path /userProfiles/{userProfileId}/projects/{projectId}/images/{imageId}
+     * @allow A signed-in user (auth.uid='user123') can (delete) an image at /userProfiles/user123/projects/proj-abc/images/img-xyz.
+     * @deny An anonymous user cannot (get) any image.
+     * @principle Enforces document ownership and validates hierarchical integrity on writes.
+     */
+    match /userProfiles/{userProfileId}/projects/{projectId}/images/{imageId} {
+      allow get: if isOwner(userProfileId);
+      allow list: if isOwner(userProfileId);
+      allow create: if isOwner(userProfileId) && request.resource.data.userProfileId == userProfileId && request.resource.data.projectId == projectId;
+      allow update: if isExistingOwner(userProfileId) && request.resource.data.userProfileId == resource.data.userProfileId && request.resource.data.projectId == resource.data.projectId;
+      allow delete: if isExistingOwner(userProfileId);
+    }
+
+    /**
+     * @description Controls access to AI-generated insights for a specific image.
+     * @path /userProfiles/{userProfileId}/projects/{projectId}/images/{imageId}/insights/{insightId}
+     * @allow A signed-in user (auth.uid='user123') can (get) an insight at /userProfiles/user123/projects/proj-abc/images/img-xyz/insights/ins-1.
+     * @deny A signed-in user (auth.uid='user456') cannot (list) insights at /userProfiles/user123/projects/proj-abc/images/img-xyz/insights.
+     * @principle Restricts access based on the ownership of the root user profile in the path.
+     */
+    match /userProfiles/{userProfileId}/projects/{projectId}/images/{imageId}/insights/{insightId} {
+      allow get: if isOwner(userProfileId);
+      allow list: if isOwner(userProfileId);
+      allow create: if isOwner(userProfileId);
+      allow update: if isExistingOwner(userProfileId);
+      allow delete: if isExistingOwner(userProfileId);
+    }
+
+    /**
+     * @description Controls access to user-specific event logs. Logs are append-only.
+     * @path /userProfiles/{userProfileId}/eventLogs/{eventLogId}
+     * @allow A signed-in user (auth.uid='user123') can (create) an event log at /userProfiles/user123/eventLogs/log-xyz.
+     * @deny Any user cannot (update) or (delete) an existing event log to maintain audit integrity.
+     * @principle Enforces immutability for audit trail collections while allowing owner-only creation and reads.
+     */
+    match /userProfiles/{userProfileId}/eventLogs/{eventLogId} {
+      allow get: if isOwner(userProfileId);
+      allow list: if isOwner(userProfileId);
+      allow create: if isOwner(userProfileId) && request.resource.data.userProfileId == userProfileId;
+      allow update: if false;
+      allow delete: if false;
+    }
+  }
+}
